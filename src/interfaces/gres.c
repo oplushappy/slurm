@@ -740,7 +740,8 @@ static int _unload_plugin(slurm_gres_context_t *gres_ctx)
 extern bool gres_is_shared_name(char *name)
 {
 	if (!xstrcmp(name, "mps") ||
-	    !xstrcmp(name, "shard"))
+	    !xstrcmp(name, "shard") ||
+	    !xstrcmp(name, "hami"))
 		return true;
 	return false;
 }
