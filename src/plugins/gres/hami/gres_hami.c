@@ -427,10 +427,14 @@ extern gres_prep_t *gres_p_prep_build_env(gres_job_state_t *gres_js)
 		    gres_js->gres_bit_alloc[i]) {
 			gres_prep->gres_bit_alloc[i] =
 				bit_copy(gres_js->gres_bit_alloc[i]);
+		}
+		if (gres_js->gres_bit_alloc &&
+		    gres_js->gres_bit_alloc[i]) {
 			gres_prep->gres_cnt_node_alloc[i] =
 				gres_js->gres_cnt_node_alloc[i];
 		}
 	}
+
 	return gres_prep;
 }
 
@@ -506,10 +510,21 @@ extern void gres_p_prep_set_env(char ***prep_env_ptr,
 	/* LD_PRELOAD */
 	_set_ld_preload(prep_env_ptr);
 
-	/* CUDA_DEVICE_MEMORY_LIMIT_0: prolog context uses single-GPU path */
-	snprintf(buf, sizeof(buf), "%"PRIu64, bytes);
-	env_array_overwrite_fmt(prep_env_ptr, "CUDA_DEVICE_MEMORY_LIMIT_0",
-				"%s", buf);
+	/* CUDA_DEVICE_MEMORY_LIMIT_{i}: one entry per visible GPU */
+	{
+		int num_gpus = gres_prep->gres_bit_alloc[node_inx] ?
+			       bit_set_count(gres_prep->gres_bit_alloc[node_inx]) : 1;
+		if (num_gpus < 1)
+			num_gpus = 1;
+		uint64_t per_gpu_bytes = bytes / (uint64_t)num_gpus;
+		for (int i = 0; i < num_gpus; i++) {
+			char var_name[48];
+			snprintf(var_name, sizeof(var_name),
+				 "CUDA_DEVICE_MEMORY_LIMIT_%d", i);
+			env_array_overwrite_fmt(prep_env_ptr, var_name,
+						"%"PRIu64, per_gpu_bytes);
+		}
+	}
 
 	/* CUDA_DEVICE_MEMORY_SHARED_CACHE: same per-job path as _set_env() */
 	{
