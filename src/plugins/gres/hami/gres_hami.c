@@ -151,34 +151,6 @@ extern int gres_p_node_config_load(list_t *gres_conf_list,
  * Return the total bytes configured for the device identified by global_id.
  * Used for informational / validation purposes.
  */
-static uint64_t _get_dev_bytes(int global_id)
-{
-	list_itr_t *itr;
-	shared_dev_info_t *info;
-	uint64_t count = NO_VAL64;
-
-	if (!shared_info) {
-		error("%s: shared_info is NULL", __func__);
-		return 0;
-	}
-
-	itr = list_iterator_create(shared_info);
-	while ((info = list_next(itr))) {
-		if (info->id == global_id) {
-			count = info->count;
-			break;
-		}
-	}
-	list_iterator_destroy(itr);
-
-	if (count == NO_VAL64) {
-		error("%s: no hami device found for global_id %d",
-		      __func__, global_id);
-		return 0;
-	}
-	return count;
-}
-
 /*
  * Prepend libvgpu.so to LD_PRELOAD, preserving any value already present.
  */
@@ -214,7 +186,6 @@ static void _set_ld_preload(char ***env_ptr)
 static void _set_env(common_gres_env_t *gres_env)
 {
 	char buf[256];
-	uint64_t dev_total_bytes;
 
 	/* global_id starts unknown; gres_common_gpu_set_env fills it in */
 	gres_env->global_id    = -1;
@@ -246,18 +217,6 @@ static void _set_env(common_gres_env_t *gres_env)
 			}
 		}
 		return;
-	}
-
-	/* Sanity-check: allocated bytes must not exceed the device total */
-	if (gres_env->global_id >= 0) {
-		dev_total_bytes = _get_dev_bytes(gres_env->global_id);
-		if (dev_total_bytes > 0 && gres_env->gres_cnt > dev_total_bytes) {
-			error("%s: job requested %"PRIu64" bytes but device %d only"
-			      " has %"PRIu64" bytes total; capping",
-			      __func__, gres_env->gres_cnt,
-			      gres_env->global_id, dev_total_bytes);
-			gres_env->gres_cnt = dev_total_bytes;
-		}
 	}
 
 	/* LD_PRELOAD: inject HAMi-core */
