@@ -3,20 +3,20 @@
  *
  *  HAMi-core provides true GPU memory isolation and SM compute limiting via
  *  LD_PRELOAD interception of CUDA API calls. This plugin exposes GPU memory
- *  (in MB) as a shareable GRES resource so that slurmctld can:
+ *  as a shareable GRES resource so that slurmctld can:
  *    - Track remaining virtual memory per GPU (bin-packing via cons_tres)
  *    - Inject HAMi-core environment variables into job steps automatically
  *
- *  gres.conf example (Count = total GPU memory in MB):
- *    Name=hami Count=40960 File=/dev/nvidia0   # A100 40 GB
- *    Name=hami Count=81920 File=/dev/nvidia1   # H100 80 GB
+ *  gres.conf example (Count = total GPU memory, supports K/M/G/T suffixes):
+ *    Name=hami Count=40G File=/dev/nvidia0   # A100 40 GB
+ *    Name=hami Count=80G File=/dev/nvidia1   # H100 80 GB
  *
  *  Submission example (request 8 GB of GPU memory):
- *    sbatch --gres=hami:8192 train.sh
+ *    sbatch --gres=hami:8G train.sh
  *
  *  Environment variables injected per job:
  *    LD_PRELOAD                     - prepends libvgpu.so
- *    CUDA_DEVICE_MEMORY_LIMIT       - hard memory cap in bytes
+ *    CUDA_DEVICE_MEMORY_LIMIT_{i}   - hard memory cap in bytes per visible GPU
  *    CUDA_DEVICE_MEMORY_SHARED_CACHE - per-job shared-region file path
  *
  *  SM utilisation limit (CUDA_DEVICE_SM_LIMIT) is NOT set by this plugin so
@@ -148,10 +148,10 @@ extern int gres_p_node_config_load(list_t *gres_conf_list,
 /* ── environment injection ─────────────────────────────────────────────── */
 
 /*
- * Return the total MB configured for the device identified by global_id.
+ * Return the total bytes configured for the device identified by global_id.
  * Used for informational / validation purposes.
  */
-static uint64_t _get_dev_mb(int global_id)
+static uint64_t _get_dev_bytes(int global_id)
 {
 	list_itr_t *itr;
 	shared_dev_info_t *info;
@@ -202,7 +202,7 @@ static void _set_ld_preload(char ***env_ptr)
  * Sets:
  *   CUDA_VISIBLE_DEVICES            (via gres_common_gpu_set_env)
  *   LD_PRELOAD                      (prepend libvgpu.so)
- *   CUDA_DEVICE_MEMORY_LIMIT_{i}    (gres_cnt/num_gpus MB → bytes, per visible GPU)
+ *   CUDA_DEVICE_MEMORY_LIMIT_{i}    (gres_cnt/num_gpus bytes, per visible GPU)
  *   CUDA_DEVICE_MEMORY_SHARED_CACHE (per-job file for HAMi-core multiprocess
  *                                    coordination within a single job;
  *                                    cross-job capacity is managed by Slurm)
@@ -214,7 +214,7 @@ static void _set_ld_preload(char ***env_ptr)
 static void _set_env(common_gres_env_t *gres_env)
 {
 	char buf[256];
-	uint64_t dev_total_mb;
+	uint64_t dev_total_bytes;
 
 	/* global_id starts unknown; gres_common_gpu_set_env fills it in */
 	gres_env->global_id    = -1;
@@ -239,7 +239,7 @@ static void _set_env(common_gres_env_t *gres_env)
 			if (num_gpus < 1)
 				num_gpus = 1;
 			for (int i = 0; i < num_gpus; i++) {
-				char var_name[32];
+				char var_name[48];
 				snprintf(var_name, sizeof(var_name),
 					 "CUDA_DEVICE_MEMORY_LIMIT_%d", i);
 				unsetenvp(*gres_env->env_ptr, var_name);
@@ -248,15 +248,15 @@ static void _set_env(common_gres_env_t *gres_env)
 		return;
 	}
 
-	/* Sanity-check: allocated MB must not exceed the device total */
+	/* Sanity-check: allocated bytes must not exceed the device total */
 	if (gres_env->global_id >= 0) {
-		dev_total_mb = _get_dev_mb(gres_env->global_id);
-		if (dev_total_mb > 0 && gres_env->gres_cnt > dev_total_mb) {
-			error("%s: job requested %"PRIu64" MB but device %d only"
-			      " has %"PRIu64" MB total; capping",
+		dev_total_bytes = _get_dev_bytes(gres_env->global_id);
+		if (dev_total_bytes > 0 && gres_env->gres_cnt > dev_total_bytes) {
+			error("%s: job requested %"PRIu64" bytes but device %d only"
+			      " has %"PRIu64" bytes total; capping",
 			      __func__, gres_env->gres_cnt,
-			      gres_env->global_id, dev_total_mb);
-			gres_env->gres_cnt = dev_total_mb;
+			      gres_env->global_id, dev_total_bytes);
+			gres_env->gres_cnt = dev_total_bytes;
 		}
 	}
 
@@ -283,11 +283,10 @@ static void _set_env(common_gres_env_t *gres_env)
 			num_gpus = 1;
 
 		uint64_t per_gpu_bytes =
-			(gres_env->gres_cnt / (uint64_t)num_gpus)
-			* 1024ULL * 1024ULL;
+			(gres_env->gres_cnt / (uint64_t)num_gpus);
 
 		for (int i = 0; i < num_gpus; i++) {
-			char var_name[32];
+			char var_name[48];
 			snprintf(var_name, sizeof(var_name),
 				 "CUDA_DEVICE_MEMORY_LIMIT_%d", i);
 			snprintf(buf, sizeof(buf), "%"PRIu64, per_gpu_bytes);
@@ -409,8 +408,11 @@ extern void gres_p_task_set_env(char ***task_env_ptr,
 extern void gres_p_send_stepd(buf_t *buffer)
 {
 	gres_send_stepd(buffer, gres_devices);
+
 	pack32(node_flags, buffer);
+	
 	gres_c_s_send_stepd(buffer);
+	return;
 }
 
 /* Receive GRES information in slurmstepd */
@@ -540,13 +542,13 @@ extern void gres_p_prep_set_env(char ***prep_env_ptr,
 		return;
 	}
 
-	uint64_t mb = gres_prep->gres_cnt_node_alloc[node_inx];
+	uint64_t bytes = gres_prep->gres_cnt_node_alloc[node_inx];
 
 	/* LD_PRELOAD */
 	_set_ld_preload(prep_env_ptr);
 
 	/* CUDA_DEVICE_MEMORY_LIMIT_0: prolog context uses single-GPU path */
-	snprintf(buf, sizeof(buf), "%"PRIu64, mb * 1024ULL * 1024ULL);
+	snprintf(buf, sizeof(buf), "%"PRIu64, bytes);
 	env_array_overwrite_fmt(prep_env_ptr, "CUDA_DEVICE_MEMORY_LIMIT_0",
 				"%s", buf);
 
